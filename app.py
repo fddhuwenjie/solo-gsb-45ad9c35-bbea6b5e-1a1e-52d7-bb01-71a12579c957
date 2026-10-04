@@ -7,6 +7,7 @@ from datetime import date
 from flask import Flask, g, jsonify, render_template, request
 
 from evaluator import MEDIA_LABELS, evaluate_timeline
+from supplement import diff_intervals, merge_licenses, validate_supplements
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "oral_history.db"))
@@ -478,18 +479,130 @@ def evaluate(iid):
         medium=medium,
     )
     duration = interview["duration_seconds"]
-    blocked = sum(i["end_seconds"] - i["start_seconds"]
-                  for i in intervals if i["status"] == "blocked")
     return jsonify(
         interview_id=iid,
         medium=medium,
         publication_date=publication_date,
         intervals=intervals,
-        summary={
-            "duration_seconds": duration,
-            "blocked_seconds": blocked,
-            "publishable_seconds": duration - blocked,
-        },
+        summary=timeline_summary(duration, intervals),
+    )
+
+
+def timeline_summary(duration, intervals):
+    blocked = sum(i["end_seconds"] - i["start_seconds"]
+                  for i in intervals if i["status"] == "blocked")
+    return {
+        "duration_seconds": duration,
+        "blocked_seconds": blocked,
+        "publishable_seconds": duration - blocked,
+    }
+
+
+# ---------------------------------------------------------------- 补件并复核
+
+@app.post("/api/interviews/<int:iid>/supplement")
+def supplement(iid):
+    """批量补充授权并复核：同一事务内试算 -> 合并重算 -> 全部可发布才写入。
+
+    请求体: {publication_date, medium, supplements: [...], commit: bool}
+        commit 缺省 / false 为试算（永不写入）；true 且合并后整条时间轴
+        全部可发布时才一次性写入整批补件，否则不落任何记录。
+    """
+    data = payload()
+    medium = data.get("medium")
+    if medium not in MEDIA:
+        return error("媒介必须是 audio（音频）或 text（文字）")
+    publication_date = parse_date_field(data.get("publication_date"))
+    if not publication_date or publication_date == "invalid":
+        return error("发布日期不能为空且格式应为 YYYY-MM-DD")
+    commit = data.get("commit") is True
+
+    db = get_db()
+    # 同一事务：复制当前授权 -> 试算 -> 合并补件重算 -> 按需一次性写入
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        interview = get_interview(iid)
+        if not interview:
+            db.rollback()
+            return error("访谈不存在", 404)
+        duration = interview["duration_seconds"]
+        speakers = db.execute(
+            "SELECT * FROM speakers WHERE interview_id = ?", (iid,)).fetchall()
+        speaker_names = {s["id"]: s["name"] for s in speakers}
+
+        cleaned, problems = validate_supplements(
+            data.get("supplements"), speaker_names, duration)
+        if problems:
+            db.rollback()
+            return jsonify(
+                error="补件批次未通过校验：" + "；".join(problems),
+                problems=problems), 400
+
+        segments = db.execute(
+            "SELECT * FROM segments WHERE interview_id = ?", (iid,)).fetchall()
+        licenses = db.execute(
+            "SELECT l.* FROM licenses l JOIN speakers s ON s.id = l.speaker_id"
+            " WHERE s.interview_id = ?", (iid,)).fetchall()
+        seg_dicts = [{"speaker_id": s["speaker_id"],
+                      "start_seconds": s["start_seconds"],
+                      "end_seconds": s["end_seconds"]} for s in segments]
+        current = [license_dict(l) for l in licenses]
+
+        # 1. 复制当前授权，按既有规则试算
+        before = evaluate_timeline(
+            duration, speaker_names, seg_dicts, merge_licenses(current, []),
+            publication_date, medium)
+        # 2. 合并整批补件后重算
+        after = evaluate_timeline(
+            duration, speaker_names, seg_dicts,
+            merge_licenses(current, cleaned), publication_date, medium)
+        publishable = all(i["status"] != "blocked" for i in after)
+
+        # 3. 仅当整条时间轴全部可发布才一次性写入，否则不落任何记录
+        created = []
+        committed = False
+        if commit and publishable:
+            for c in cleaned:
+                cur = db.execute(
+                    "INSERT INTO licenses (speaker_id, start_seconds,"
+                    " end_seconds, allow_media, deny_media, embargo_until,"
+                    " note) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (c["speaker_id"], c["start_seconds"], c["end_seconds"],
+                     json.dumps(c["allow_media"]),
+                     json.dumps(c["deny_media"]),
+                     c["embargo_until"], c["note"]))
+                created.append({
+                    "id": cur.lastrowid,
+                    "speaker_id": c["speaker_id"],
+                    "start_seconds": c["start_seconds"],
+                    "end_seconds": c["end_seconds"],
+                    "allow_media": c["allow_media"],
+                    "deny_media": c["deny_media"],
+                    "embargo_until": c["embargo_until"],
+                    "note": c["note"],
+                })
+            db.commit()
+            committed = True
+        else:
+            db.rollback()
+    except Exception:
+        db.rollback()
+        raise
+
+    return jsonify(
+        interview_id=iid,
+        medium=medium,
+        publication_date=publication_date,
+        commit=commit,
+        publishable=publishable,
+        committed=committed,
+        created_licenses=created,
+        changed_intervals=diff_intervals(before, after),
+        blocked_intervals=[i for i in after if i["status"] == "blocked"],
+        before={"intervals": before,
+                "summary": timeline_summary(duration, before)},
+        after={"intervals": after,
+               "summary": timeline_summary(duration, after)},
     )
 
 

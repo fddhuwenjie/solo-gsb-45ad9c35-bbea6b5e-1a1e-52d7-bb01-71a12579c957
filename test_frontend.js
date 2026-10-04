@@ -31,13 +31,15 @@ const sandbox = {
   fetch: async (path, opts) => {
     calls.push({ path, opts });
     const isGet = !opts || !opts.method || opts.method === "GET";
-    return { ok: true, json: async () => (isGet ? sandbox.__test__.state.detail : {}) };
+    const body = isGet ? sandbox.__test__.state.detail
+      : (sandbox.__test__.nextResponse || {});
+    return { ok: true, json: async () => body };
   },
 };
 vm.createContext(sandbox);
 const code = fs.readFileSync("static/app.js", "utf8");
 vm.runInContext(
-  code + "\nglobalThis.__test__ = { state, render, renderResults, saveSegment, saveLicense, fmt, parseTimecode };",
+  code + "\nglobalThis.__test__ = { state, render, renderResults, saveSegment, saveLicense, fmt, parseTimecode, renderBatch, renderSupplementResult, submitSupplement };",
   sandbox
 );
 const T = sandbox.__test__;
@@ -116,6 +118,91 @@ async function main() {
   assert.ok(elements.get("results-body").innerHTML.includes("00:00:00 – 00:10:00"));
   assert.ok(elements.get("timeline").innerHTML.includes("blocked"));
   assert.ok(elements.get("results-summary").innerHTML.includes("2026-09-23"));
+
+  // 6. 补件批次编辑：动态行 ID 与提交体
+  T.state.batch = [{
+    speaker_id: 2, start: "00:05:00", end: "00:10:00",
+    allow: ["audio"], deny: [], embargo: "", note: "补授权",
+  }];
+  T.renderBatch();
+  const batchHtml = elements.get("supp-body").innerHTML;
+  for (const id of ["supp-0-sp", "supp-0-start", "supp-0-end",
+    "supp-0-allow-audio", "supp-0-allow-text",
+    "supp-0-deny-audio", "supp-0-deny-text",
+    "supp-0-emb", "supp-0-note"]) {
+    assert.ok(batchHtml.includes(`id="${id}"`), `补件行缺少 ${id}`);
+  }
+  assert.ok(batchHtml.includes("补1"));
+
+  el("pub-date").value = "2026-10-04";
+  el("medium").value = "audio";
+  el("supp-0-sp").value = "2";
+  el("supp-0-start").value = "00:05:00";
+  el("supp-0-end").value = "00:10:00";
+  el("supp-0-allow-audio").checked = true;
+  el("supp-0-allow-text").checked = false;
+  el("supp-0-deny-audio").checked = false;
+  el("supp-0-deny-text").checked = false;
+  el("supp-0-emb").value = "";
+  el("supp-0-note").value = "补授权";
+
+  // 7. 试算：请求体正确，结果区展示变更区间
+  T.nextResponse = {
+    publication_date: "2026-10-04", medium: "audio",
+    commit: false, publishable: true, committed: false,
+    created_licenses: [],
+    changed_intervals: [{
+      start_seconds: 300, end_seconds: 600,
+      start_timecode: "00:05:00", end_timecode: "00:10:00",
+      before_status: "blocked", after_status: "ok",
+      before_status_label: "不可发布", after_status_label: "可发布",
+    }],
+    blocked_intervals: [],
+    before: { intervals: [], summary: { duration_seconds: 3600, blocked_seconds: 600, publishable_seconds: 3000 } },
+    after: {
+      intervals: [{
+        start_seconds: 0, end_seconds: 3600,
+        start_timecode: "00:00:00", end_timecode: "01:00:00",
+        status: "ok", status_label: "可发布", speakers: ["李四"], reasons: [],
+      }],
+      summary: { duration_seconds: 3600, blocked_seconds: 0, publishable_seconds: 3600 },
+    },
+  };
+  await T.submitSupplement(false);
+  const suppPost = calls.filter((c) => c.path.includes("/supplement")).pop();
+  assert.deepStrictEqual(JSON.parse(suppPost.opts.body), {
+    publication_date: "2026-10-04", medium: "audio", commit: false,
+    supplements: [{
+      speaker_id: 2, start_seconds: 300, end_seconds: 600,
+      allow_media: ["audio"], deny_media: [],
+      embargo_until: null, note: "补授权",
+    }],
+  });
+  const suppHtml = elements.get("supp-result").innerHTML;
+  assert.ok(suppHtml.includes("试算通过"));
+  assert.ok(suppHtml.includes("00:05:00 – 00:10:00"));
+  assert.ok(suppHtml.includes("变更区间"));
+
+  // 8. 复核未通过：展示阻断区间与原因
+  T.nextResponse = {
+    publication_date: "2026-10-04", medium: "audio",
+    commit: true, publishable: false, committed: false,
+    created_licenses: [],
+    changed_intervals: [],
+    blocked_intervals: [{
+      start_seconds: 450, end_seconds: 600,
+      start_timecode: "00:07:30", end_timecode: "00:10:00",
+      status: "blocked", status_label: "不可发布",
+      speakers: ["李四"], reasons: ["李四：缺少覆盖该区间的授权记录（缺项）"],
+    }],
+    before: { intervals: [], summary: { duration_seconds: 3600, blocked_seconds: 600, publishable_seconds: 3000 } },
+    after: { intervals: [], summary: { duration_seconds: 3600, blocked_seconds: 150, publishable_seconds: 3450 } },
+  };
+  await T.submitSupplement(true);
+  const failHtml = elements.get("supp-result").innerHTML;
+  assert.ok(failHtml.includes("复核未通过"));
+  assert.ok(failHtml.includes("阻断区间"));
+  assert.ok(failHtml.includes("缺项"));
 
   console.log("test_frontend.js: 全部通过");
 }

@@ -166,3 +166,21 @@ tr.no_speech td { background: #f6f7f8; }
 }
 
 #status-line.error { color: var(--bad); }
+
+/* 补件并复核 */
+#supp-result hr {
+  border: none;
+  border-top: 1px solid var(--line);
+  margin: 14px 0;
+}
+
+#supp-result h3 {
+  margin: 14px 0 8px;
+  font-size: 14px;
+}
+
+.supp-verdict { font-size: 14.5px; margin: 0 0 8px; }
+
+#supp-result .timeline { margin-top: 10px; }
+
+#supp-result table { margin-bottom: 6px; }

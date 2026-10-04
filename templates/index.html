@@ -123,6 +123,33 @@
         <tbody id="results-body"></tbody>
       </table>
     </section>
+
+    <section class="card" id="supplement-card">
+      <h2>6. 补件并复核</h2>
+      <p class="hint">
+        针对上方选定的发布日期与媒介批量补充授权：先在下方编辑补件批次，点击「试算」
+        查看合并后的时间轴与变更区间（不写入）；确认无误后点击「补件并复核」，
+        仅当整条时间轴全部可发布时整批一次性写入，否则不落任何记录。
+        同一说话人的补件区间不得重叠，同一补件不得既允许又拒绝同一媒介，区间不得越界。
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>#</th><th>说话人</th><th>开始</th><th>结束</th>
+            <th>允许媒介</th><th>拒绝媒介</th><th>解禁日期</th><th>备注</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="supp-body"></tbody>
+        <tfoot><tr>
+          <td colspan="9"><button id="btn-supp-add">添加补件行</button></td>
+        </tr></tfoot>
+      </table>
+      <div class="row">
+        <button id="btn-supp-dry">试算（不写入）</button>
+        <button id="btn-supp-commit" class="primary">补件并复核（全部可发布才写入）</button>
+      </div>
+      <div id="supp-result"></div>
+    </section>
   </div>
 
   <p id="status-line" role="status"></p>

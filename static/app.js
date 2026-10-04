@@ -11,6 +11,7 @@ const state = {
   interviews: [],
   currentId: null,
   detail: null, // {id, title, duration_seconds, speakers, segments, licenses}
+  batch: [],    // 补件批次（未提交的编辑行）
 };
 
 const $ = (id) => document.getElementById(id);
@@ -113,6 +114,8 @@ function render() {
   renderSpeakers();
   renderSegments();
   renderLicenses();
+  captureBatch();
+  renderBatch();
 }
 
 function speakerOptions(selected) {
@@ -196,6 +199,16 @@ function clearResults() {
   $("results-body").innerHTML = "";
 }
 
+function timelineHtml(intervals, duration) {
+  return intervals.map((it) => {
+    const width = (it.end_seconds - it.start_seconds) / duration * 100;
+    const tip = `${it.start_timecode}–${it.end_timecode} ${it.status_label}`
+      + (it.reasons.length ? "\n" + it.reasons.join("\n") : "");
+    return `<div class="seg ${it.status}" style="width:${width}%"`
+      + ` title="${esc(tip)}"></div>`;
+  }).join("");
+}
+
 function renderResults(data) {
   const { intervals, summary } = data;
   const mediumLabel = data.medium === "audio" ? "音频" : "文字";
@@ -205,14 +218,7 @@ function renderResults(data) {
     + `可发布 <b class="ok-text">${fmt(summary.publishable_seconds)}</b>，`
     + `不可发布 <b class="bad-text">${fmt(summary.blocked_seconds)}</b>`;
 
-  $("timeline").innerHTML = intervals.map((it) => {
-    const width = (it.end_seconds - it.start_seconds)
-      / summary.duration_seconds * 100;
-    const tip = `${it.start_timecode}–${it.end_timecode} ${it.status_label}`
-      + (it.reasons.length ? "\n" + it.reasons.join("\n") : "");
-    return `<div class="seg ${it.status}" style="width:${width}%"`
-      + ` title="${esc(tip)}"></div>`;
-  }).join("");
+  $("timeline").innerHTML = timelineHtml(intervals, summary.duration_seconds);
 
   $("results-body").innerHTML = intervals.map((it) => `
     <tr class="${it.status}">
@@ -257,6 +263,7 @@ async function deleteInterview() {
   await api(`/api/interviews/${state.currentId}`, "DELETE");
   state.currentId = null;
   clearResults();
+  clearSupplement();
   await loadInterviews();
 }
 
@@ -368,6 +375,166 @@ async function evaluate() {
   renderResults(data);
 }
 
+/* ---------- 补件并复核 ---------- */
+
+function emptyBatchRow() {
+  const first = state.detail && state.detail.speakers[0];
+  return {
+    speaker_id: first ? first.id : null,
+    start: "00:00:00",
+    end: state.detail ? fmt(state.detail.duration_seconds) : "00:00:00",
+    allow: ["audio"],
+    deny: [],
+    embargo: "",
+    note: "",
+  };
+}
+
+/* 把页面上未保存的补件行读回 state.batch（重新渲染前调用） */
+function captureBatch() {
+  state.batch.forEach((row, i) => {
+    const sp = $(`supp-${i}-sp`);
+    if (!sp || !$(`supp-${i}-start`)) return;
+    row.speaker_id = Number(sp.value) || null;
+    row.start = $(`supp-${i}-start`).value;
+    row.end = $(`supp-${i}-end`).value;
+    row.allow = readMediaCheckboxes(`supp-${i}-allow`);
+    row.deny = readMediaCheckboxes(`supp-${i}-deny`);
+    row.embargo = $(`supp-${i}-emb`).value;
+    row.note = $(`supp-${i}-note`).value;
+  });
+}
+
+function renderBatch() {
+  const rows = state.batch.map((row, i) => `
+    <tr>
+      <td>补${i + 1}</td>
+      <td><select id="supp-${i}-sp">${speakerOptions(row.speaker_id)}</select></td>
+      <td><input id="supp-${i}-start" class="tc-input" value="${esc(row.start)}"></td>
+      <td><input id="supp-${i}-end" class="tc-input" value="${esc(row.end)}"></td>
+      <td>${mediaCheckboxes(`supp-${i}-allow`, row.allow)}</td>
+      <td>${mediaCheckboxes(`supp-${i}-deny`, row.deny)}</td>
+      <td><input type="date" id="supp-${i}-emb" value="${esc(row.embargo)}"></td>
+      <td><input id="supp-${i}-note" value="${esc(row.note)}"></td>
+      <td><button class="danger" onclick="run(() => delBatchRow(${i}))">删除</button></td>
+    </tr>`).join("");
+  $("supp-body").innerHTML = rows
+    || `<tr><td colspan="9" class="empty">暂无补件，点击下方「添加补件行」</td></tr>`;
+}
+
+async function addBatchRow() {
+  captureBatch();
+  state.batch.push(emptyBatchRow());
+  renderBatch();
+}
+
+async function delBatchRow(i) {
+  captureBatch();
+  state.batch.splice(i, 1);
+  renderBatch();
+}
+
+function clearSupplement() {
+  state.batch = [];
+  renderBatch();
+  $("supp-result").innerHTML = "";
+}
+
+function readBatchPayload() {
+  captureBatch();
+  if (!state.batch.length) throw new Error("请先添加补件行");
+  return state.batch.map((row, i) => {
+    if (!row.speaker_id) throw new Error(`补${i + 1}：请选择说话人`);
+    const start_seconds = parseTimecode(row.start);
+    const end_seconds = parseTimecode(row.end);
+    if (!Number.isInteger(start_seconds) || !Number.isInteger(end_seconds)) {
+      throw new Error(`补${i + 1}：时间码格式应为 HH:MM:SS`);
+    }
+    return {
+      speaker_id: row.speaker_id,
+      start_seconds,
+      end_seconds,
+      allow_media: row.allow,
+      deny_media: row.deny,
+      embargo_until: row.embargo || null,
+      note: row.note.trim(),
+    };
+  });
+}
+
+async function submitSupplement(commit) {
+  const publication_date = $("pub-date").value;
+  const medium = $("medium").value;
+  if (!publication_date) throw new Error("请选择发布日期");
+  const supplements = readBatchPayload();
+  if (commit
+      && !confirm("确认提交整批补件？仅当合并后整条时间轴全部可发布时才会一次性写入。")) {
+    return;
+  }
+  const data = await api(`/api/interviews/${state.currentId}/supplement`, "POST",
+    { publication_date, medium, supplements, commit });
+  if (data.committed) {
+    state.batch = [];
+    await refreshDetail();
+    render();
+  }
+  renderSupplementResult(data);
+}
+
+function renderSupplementResult(data) {
+  const mediumLabel = data.medium === "audio" ? "音频" : "文字";
+  const created = data.created_licenses || [];
+  const head = data.committed
+    ? `<p class="supp-verdict ok-text">已一次性写入 ${created.length} 条补件授权`
+      + `（许可 ${created.map((l) => "#" + l.id).join("、")}），`
+      + `变更区间见下。</p>`
+    : data.publishable
+      ? `<p class="supp-verdict ok-text">试算通过：合并补件后整条时间轴`
+        + `全部可发布（未写入，可点击「补件并复核」落库）。</p>`
+      : `<p class="supp-verdict bad-text">`
+        + `${data.commit ? "复核未通过" : "试算未通过"}：仍有 `
+        + `${data.blocked_intervals.length} 个阻断区间，未落任何记录。</p>`;
+
+  const changed = data.changed_intervals || [];
+  const changedHtml = changed.length ? `
+    <h3>变更区间（${changed.length}）</h3>
+    <table>
+      <thead><tr><th>区间（时间码）</th><th>变更前</th><th>变更后</th></tr></thead>
+      <tbody>${changed.map((c) => `
+        <tr>
+          <td class="tc">${c.start_timecode} – ${c.end_timecode}</td>
+          <td><span class="badge ${c.before_status}">${c.before_status_label}</span></td>
+          <td><span class="badge ${c.after_status}">${c.after_status_label}</span></td>
+        </tr>`).join("")}</tbody>
+    </table>` : "";
+
+  const blocked = data.blocked_intervals || [];
+  const blockedHtml = blocked.length ? `
+    <h3>阻断区间（${blocked.length}）</h3>
+    <table>
+      <thead><tr><th>区间（时间码）</th><th>说话人</th><th>原因</th></tr></thead>
+      <tbody>${blocked.map((it) => `
+        <tr class="blocked">
+          <td class="tc">${it.start_timecode} – ${it.end_timecode}</td>
+          <td>${it.speakers.length ? esc(it.speakers.join("、")) : "—"}</td>
+          <td>${it.reasons.map(esc).join("<br>")}</td>
+        </tr>`).join("")}</tbody>
+    </table>` : "";
+
+  const s = data.after.summary;
+  $("supp-result").innerHTML = `
+    <hr>
+    ${head}
+    <p class="hint">发布日期 ${esc(data.publication_date)} · 媒介 ${mediumLabel} ·
+      合并补件后：可发布 ${fmt(s.publishable_seconds)}，
+      不可发布 ${fmt(s.blocked_seconds)}
+      （补件前不可发布 ${fmt(data.before.summary.blocked_seconds)}）</p>
+    <div class="timeline">${timelineHtml(data.after.intervals,
+      s.duration_seconds)}</div>
+    ${changedHtml}
+    ${blockedHtml}`;
+}
+
 /* ---------- 启动 ---------- */
 
 window.addEventListener("DOMContentLoaded", () => {
@@ -380,11 +547,15 @@ window.addEventListener("DOMContentLoaded", () => {
   $("btn-add-segment").addEventListener("click", () => run(addSegment));
   $("btn-add-license").addEventListener("click", () => run(addLicense));
   $("btn-evaluate").addEventListener("click", () => run(evaluate));
+  $("btn-supp-add").addEventListener("click", () => run(addBatchRow));
+  $("btn-supp-dry").addEventListener("click", () => run(() => submitSupplement(false)));
+  $("btn-supp-commit").addEventListener("click", () => run(() => submitSupplement(true)));
   $("interview-select").addEventListener("change", (e) => run(async () => {
     state.currentId = Number(e.target.value) || null;
     await refreshDetail();
     render();
     clearResults();
+    clearSupplement();
   }));
   run(loadInterviews);
 });
