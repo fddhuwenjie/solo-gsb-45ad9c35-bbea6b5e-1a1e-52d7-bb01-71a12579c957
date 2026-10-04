@@ -7,6 +7,7 @@ from datetime import date
 from flask import Flask, g, jsonify, render_template, request
 
 from evaluator import MEDIA_LABELS, evaluate_timeline
+from remediation import run_remediation
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "oral_history.db"))
@@ -491,6 +492,39 @@ def evaluate(iid):
             "publishable_seconds": duration - blocked,
         },
     )
+
+
+# ---------------------------------------------------------------- 补件并复核
+
+@app.post("/api/interviews/<int:iid>/remediate")
+def remediate(iid):
+    """补件并复核：同一 SQLite 事务中先试算当前授权，再合并整批补件重算。
+
+    请求体 {publication_date, medium, commit, supplements: [...]}。
+    仅当合并补件后整条时间轴全部可发布且 commit 为真时才一次性写入；
+    否则不落任何记录，返回每个阻断区间及原因（commit 时 HTTP 409）。
+    重叠 / 互相冲突 / 越界的补件令整批失败（HTTP 400）。
+    """
+    interview = get_interview(iid)
+    if not interview:
+        return error("访谈不存在", 404)
+    data = payload()
+    medium = data.get("medium")
+    if medium not in MEDIA:
+        return error("媒介必须是 audio（音频）或 text（文字）")
+    publication_date = parse_date_field(data.get("publication_date"))
+    if not publication_date or publication_date == "invalid":
+        return error("发布日期不能为空且格式应为 YYYY-MM-DD")
+    result, status = run_remediation(
+        get_db(),
+        interview_id=iid,
+        duration=interview["duration_seconds"],
+        publication_date=publication_date,
+        medium=medium,
+        raw_supplements=data.get("supplements"),
+        commit=bool(data.get("commit")),
+    )
+    return jsonify(result), status
 
 
 if __name__ == "__main__":

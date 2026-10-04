@@ -11,6 +11,8 @@ const state = {
   interviews: [],
   currentId: null,
   detail: null, // {id, title, duration_seconds, speakers, segments, licenses}
+  remBatch: [], // 补件批次草稿 [{speaker_id, start, end, allow, deny, embargo, note}]
+  remResult: null, // 最近一次补件试算 / 写入结果
 };
 
 const $ = (id) => document.getElementById(id);
@@ -113,6 +115,8 @@ function render() {
   renderSpeakers();
   renderSegments();
   renderLicenses();
+  renderRemediate();
+  renderRemResult();
 }
 
 function speakerOptions(selected) {
@@ -196,6 +200,19 @@ function clearResults() {
   $("results-body").innerHTML = "";
 }
 
+function intervalRowsHtml(intervals) {
+  return intervals.map((it) => `
+    <tr class="${it.status}">
+      <td class="tc">${it.start_timecode} – ${it.end_timecode}</td>
+      <td>${fmt(it.end_seconds - it.start_seconds)}</td>
+      <td><span class="badge ${it.status}">${it.status_label}</span></td>
+      <td>${it.speakers.length ? esc(it.speakers.join("、")) : "—"}</td>
+      <td>${it.reasons.length
+        ? it.reasons.map(esc).join("<br>")
+        : (it.status === "no_speech" ? "无发言，无需授权" : "全部发言人授权有效")}</td>
+    </tr>`).join("");
+}
+
 function renderResults(data) {
   const { intervals, summary } = data;
   const mediumLabel = data.medium === "audio" ? "音频" : "文字";
@@ -214,16 +231,7 @@ function renderResults(data) {
       + ` title="${esc(tip)}"></div>`;
   }).join("");
 
-  $("results-body").innerHTML = intervals.map((it) => `
-    <tr class="${it.status}">
-      <td class="tc">${it.start_timecode} – ${it.end_timecode}</td>
-      <td>${fmt(it.end_seconds - it.start_seconds)}</td>
-      <td><span class="badge ${it.status}">${it.status_label}</span></td>
-      <td>${it.speakers.length ? esc(it.speakers.join("、")) : "—"}</td>
-      <td>${it.reasons.length
-        ? it.reasons.map(esc).join("<br>")
-        : (it.status === "no_speech" ? "无发言，无需授权" : "全部发言人授权有效")}</td>
-    </tr>`).join("");
+  $("results-body").innerHTML = intervalRowsHtml(intervals);
 }
 
 /* ---------- 访谈操作 ---------- */
@@ -256,6 +264,8 @@ async function deleteInterview() {
   if (!confirm("确定删除该访谈及其全部说话人、发言与授权记录？")) return;
   await api(`/api/interviews/${state.currentId}`, "DELETE");
   state.currentId = null;
+  state.remBatch = [];
+  state.remResult = null;
   clearResults();
   await loadInterviews();
 }
@@ -368,6 +378,144 @@ async function evaluate() {
   renderResults(data);
 }
 
+/* ---------- 补件并复核 ---------- */
+
+function renderRemediate() {
+  const rows = state.remBatch.map((row, i) => `
+    <tr>
+      <td>${i + 1}</td>
+      <td><select id="rem-${i}-sp">${speakerOptions(row.speaker_id)}</select></td>
+      <td><input id="rem-${i}-start" class="tc-input" placeholder="00:00:00" value="${esc(row.start)}"></td>
+      <td><input id="rem-${i}-end" class="tc-input" placeholder="00:10:00" value="${esc(row.end)}"></td>
+      <td>${mediaCheckboxes(`rem-${i}-allow`, row.allow)}</td>
+      <td>${mediaCheckboxes(`rem-${i}-deny`, row.deny)}</td>
+      <td><input type="date" id="rem-${i}-emb" value="${esc(row.embargo || "")}"></td>
+      <td><input id="rem-${i}-note" value="${esc(row.note || "")}"></td>
+      <td><button class="danger" onclick="run(() => removeRemRow(${i}))">删除</button></td>
+    </tr>`).join("");
+  $("remediate-body").innerHTML =
+    rows || `<tr><td colspan="9" class="empty">暂无补件，点击「添加一行」</td></tr>`;
+}
+
+/* 重渲染前把页面上的编辑同步回 state.remBatch */
+function syncRemBatch() {
+  state.remBatch = state.remBatch.map((row, i) => {
+    if (!$(`rem-${i}-sp`)) return row;
+    return {
+      speaker_id: Number($(`rem-${i}-sp`).value) || null,
+      start: $(`rem-${i}-start`).value,
+      end: $(`rem-${i}-end`).value,
+      allow: readMediaCheckboxes(`rem-${i}-allow`),
+      deny: readMediaCheckboxes(`rem-${i}-deny`),
+      embargo: $(`rem-${i}-emb`).value,
+      note: $(`rem-${i}-note`).value,
+    };
+  });
+}
+
+async function addRemRow() {
+  syncRemBatch();
+  state.remBatch.push({
+    speaker_id: state.detail.speakers.length ? state.detail.speakers[0].id : null,
+    start: "", end: "", allow: ["audio"], deny: [], embargo: "", note: "",
+  });
+  renderRemediate();
+}
+
+async function removeRemRow(i) {
+  syncRemBatch();
+  state.remBatch.splice(i, 1);
+  renderRemediate();
+}
+
+function renderRemResult() {
+  const data = state.remResult;
+  const box = $("remediate-result");
+  if (!data) {
+    box.innerHTML = "";
+    return;
+  }
+  const mediumLabel = data.medium === "audio" ? "音频" : "文字";
+  let headline;
+  if (data.committed) {
+    headline = `<p class="ok-text">✔ 整条时间轴均可发布，已一次性写入 `
+      + `${data.inserted_license_ids.length} 条补充授权`
+      + `（许可 ${data.inserted_license_ids.map((id) => "#" + id).join("、")}），`
+      + `以下为变更后的区间。</p>`;
+  } else if (data.blocked && data.blocked.length) {
+    headline = `<p class="bad-text">✘ 合并补件后仍有 ${data.blocked.length} 个`
+      + `不可发布区间，未写入任何记录。</p>`;
+  } else {
+    headline = `<p class="ok-text">✔ 试算通过：合并补件后整条时间轴均可发布`
+      + `（尚未写入，确认无误请点击「补件并写入」）。</p>`;
+  }
+  const sum = (s) =>
+    `可发布 ${fmt(s.publishable_seconds)} / 共 ${fmt(s.duration_seconds)}`
+    + `（阻断 ${fmt(s.blocked_seconds)}）`;
+  box.innerHTML = `
+    <div class="summary">发布日期 <b>${esc(data.publication_date)}</b> · 媒介 <b>${mediumLabel}</b></div>
+    ${headline}
+    <p class="hint">试算前：${sum(data.before.summary)}<br>`
+    + `${data.committed ? "写入后" : "合并补件后"}：${sum(data.after.summary)}</p>
+    <table>
+      <thead>
+        <tr><th>区间（时间码）</th><th>时长</th><th>结果</th><th>说话人</th><th>原因 / 说明</th></tr>
+      </thead>
+      <tbody>${intervalRowsHtml(data.after.intervals)}</tbody>
+    </table>`;
+}
+
+async function submitRemediate(commit) {
+  syncRemBatch();
+  if (!state.remBatch.length) throw new Error("请先添加补件行");
+  const publication_date = $("pub-date").value;
+  const medium = $("medium").value;
+  if (!publication_date) throw new Error("请选择发布日期");
+  const supplements = state.remBatch.map((row, i) => {
+    if (!row.speaker_id) throw new Error(`第 ${i + 1} 行请选择说话人`);
+    const start_seconds = parseTimecode(row.start);
+    const end_seconds = parseTimecode(row.end);
+    if (!Number.isInteger(start_seconds) || !Number.isInteger(end_seconds)) {
+      throw new Error(`第 ${i + 1} 行时间码格式应为 HH:MM:SS`);
+    }
+    return {
+      speaker_id: row.speaker_id,
+      start_seconds,
+      end_seconds,
+      allow_media: row.allow,
+      deny_media: row.deny,
+      embargo_until: row.embargo || null,
+      note: String(row.note || "").trim(),
+    };
+  });
+  let resp;
+  try {
+    resp = await fetch(`/api/interviews/${state.currentId}/remediate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ publication_date, medium, commit, supplements }),
+    });
+  } catch (e) {
+    throw new Error("无法连接服务器");
+  }
+  const data = await resp.json().catch(() => ({}));
+  if (resp.status === 409) {
+    // 仍有阻断区间：展示试算结果与原因，再提示未写入
+    state.remResult = data;
+    renderRemResult();
+    throw new Error(data.error || "仍存在不可发布区间，未写入任何补件");
+  }
+  if (!resp.ok) throw new Error(data.error || `请求失败（HTTP ${resp.status}）`);
+  state.remResult = data;
+  if (data.committed) {
+    state.remBatch = [];
+    await refreshDetail();
+    render();
+  } else {
+    renderRemResult();
+  }
+}
+
 /* ---------- 启动 ---------- */
 
 window.addEventListener("DOMContentLoaded", () => {
@@ -380,8 +528,13 @@ window.addEventListener("DOMContentLoaded", () => {
   $("btn-add-segment").addEventListener("click", () => run(addSegment));
   $("btn-add-license").addEventListener("click", () => run(addLicense));
   $("btn-evaluate").addEventListener("click", () => run(evaluate));
+  $("btn-rem-add").addEventListener("click", () => run(addRemRow));
+  $("btn-rem-dry").addEventListener("click", () => run(() => submitRemediate(false)));
+  $("btn-rem-commit").addEventListener("click", () => run(() => submitRemediate(true)));
   $("interview-select").addEventListener("change", (e) => run(async () => {
     state.currentId = Number(e.target.value) || null;
+    state.remBatch = [];
+    state.remResult = null;
     await refreshDetail();
     render();
     clearResults();

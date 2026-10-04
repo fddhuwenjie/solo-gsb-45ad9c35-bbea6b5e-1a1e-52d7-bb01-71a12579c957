@@ -123,6 +123,30 @@
         <tbody id="results-body"></tbody>
       </table>
     </section>
+
+    <section class="card" id="remediate-card">
+      <h2>6. 补件并复核</h2>
+      <p class="hint">
+        沿用上方发布日期与媒介：系统在同一事务中先按当前授权试算，再合并整批补件重算；
+        仅当整条时间轴全部可发布时才一次性写入，否则不落任何记录并列出每个阻断区间及原因。
+        同一说话人的补件时间区间不得重叠，同一补件不得同时允许并拒绝同一媒介，越界补件令整批失败。
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>#</th><th>说话人</th><th>开始</th><th>结束</th>
+            <th>允许媒介</th><th>拒绝媒介</th><th>解禁日期</th><th>备注</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="remediate-body"></tbody>
+      </table>
+      <div class="row">
+        <button id="btn-rem-add">添加一行</button>
+        <button id="btn-rem-dry">试算（不写入）</button>
+        <button id="btn-rem-commit" class="primary">补件并写入</button>
+      </div>
+      <div id="remediate-result"></div>
+    </section>
   </div>
 
   <p id="status-line" role="status"></p>

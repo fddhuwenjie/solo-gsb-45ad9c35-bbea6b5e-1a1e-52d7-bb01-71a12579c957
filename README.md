@@ -47,8 +47,75 @@ python app.py          # 默认监听 8000 端口，可用 PORT 环境变量修�
 4. **授权区间**：录入每位说话人的授权起止时间码、允许媒介、拒绝媒介、解禁日期（留空表示立即可用）。
 5. **发布校验**：选择发布日期与媒介（音频 / 文字），点击「开始校验」，
    查看时间轴色带（绿=可发布，红=不可发布，灰=无发言）与逐段时间码结果及原因。
+6. **补件并复核**：校验结果下方的批次编辑器中逐行录入待补授权
+   （说话人、半开时间区间、允许 / 拒绝媒介、解禁日期），先点「试算（不写入）」
+   查看合并前后的时间轴对比；确认整条时间轴均可发布后点「补件并写入」一次性落库。
+   仍有阻断时不落任何记录，并列出每个阻断区间及原因。
 
 所有记录均可在页面上直接修改、保存或删除。
+
+## 补件并复核（批量补授权）
+
+`POST /api/interviews/<id>/remediate` 针对一个访谈、发布日期和媒介提交一批待补授权。
+系统在同一 SQLite 事务（`BEGIN IMMEDIATE`）中：
+
+1. 复制当前授权，按既有规则（拒绝优先、解禁日期、所有发言人覆盖）试算；
+2. 校验整批补件 —— 同一说话人的补件时间区间重叠、同一补件允许与拒绝并存、
+   区间越界（超出访谈时长）或说话人不属于该访谈，均令**整批失败**（HTTP 400）；
+3. 把整批补件合并后重算；
+4. 仅当整条时间轴全部可发布且 `commit` 为真时才一次性写入全部补件；
+   否则回滚，不落任何记录（HTTP 409，返回每个阻断区间及原因）。
+
+请求体：
+
+```json
+{
+  "publication_date": "2026-10-04",
+  "medium": "audio",
+  "commit": false,
+  "supplements": [
+    {"speaker_id": 1, "start_seconds": 300, "end_seconds": 600,
+     "allow_media": ["audio"], "deny_media": [],
+     "embargo_until": null, "note": "补签授权"}
+  ]
+}
+```
+
+- `commit=false`（默认）：仅试算，返回合并前（`before`）与合并后（`after`）的
+  时间轴区间、汇总与 `blocked` 阻断列表，不写库。
+- `commit=true`：全部可发布才写入，成功结果含 `inserted_license_ids`
+  与变更后的区间（`after.intervals`）；否则返回 409 与每个阻断区间及原因。
+
+调用示例（先建访谈、说话人与发言区间，再补件）：
+
+```bash
+# 准备数据：600 秒访谈，说话人 #1 发言 0-600，授权仅覆盖 0-300
+curl -s -X POST http://localhost:8000/api/interviews \
+  -H 'Content-Type: application/json' \
+  -d '{"title": "示例访谈", "duration_seconds": 600}'
+curl -s -X POST http://localhost:8000/api/interviews/1/speakers \
+  -H 'Content-Type: application/json' -d '{"name": "张三"}'
+curl -s -X POST http://localhost:8000/api/interviews/1/segments \
+  -H 'Content-Type: application/json' \
+  -d '{"speaker_id": 1, "start_seconds": 0, "end_seconds": 600}'
+curl -s -X POST http://localhost:8000/api/speakers/1/licenses \
+  -H 'Content-Type: application/json' \
+  -d '{"start_seconds": 0, "end_seconds": 300, "allow_media": ["audio"]}'
+
+# 试算（不写入）：补 300-600 的音频授权
+curl -s -X POST http://localhost:8000/api/interviews/1/remediate \
+  -H 'Content-Type: application/json' \
+  -d '{"publication_date": "2026-10-04", "medium": "audio", "commit": false,
+       "supplements": [{"speaker_id": 1, "start_seconds": 300, "end_seconds": 600,
+                        "allow_media": ["audio"], "note": "补签授权"}]}'
+
+# 补件并写入：整条时间轴可发布，一次性落库
+curl -s -X POST http://localhost:8000/api/interviews/1/remediate \
+  -H 'Content-Type: application/json' \
+  -d '{"publication_date": "2026-10-04", "medium": "audio", "commit": true,
+       "supplements": [{"speaker_id": 1, "start_seconds": 300, "end_seconds": 600,
+                        "allow_media": ["audio"], "note": "补签授权"}]}'
+```
 
 ## 数据持久化
 
@@ -70,11 +137,14 @@ python app.py          # 默认监听 8000 端口，可用 PORT 环境变量修�
 | POST | `/api/speakers/<id>/licenses` | 添加授权 `{start_seconds, end_seconds, allow_media, deny_media, embargo_until, note}` |
 | PUT / DELETE | `/api/licenses/<id>` | 修改 / 删除授权 |
 | POST | `/api/interviews/<id>/evaluate` | 校验 `{publication_date, medium}`，返回合并后的时间码区间与原因 |
+| POST | `/api/interviews/<id>/remediate` | 补件并复核 `{publication_date, medium, commit, supplements}`，同一事务试算 + 满足条件才一次性写入 |
 
 ## 运行测试
 
 ```bash
-python -m unittest test_evaluator.py -v   # 核心校验逻辑（纯 Python）
+python -m unittest test_evaluator.py -v   # 核心校验逻辑 + 补件批次校验（纯 Python）
+python -m unittest test_remediation.py -v # 补件事务编排（纯 Python + SQLite）
+python -m unittest test_remediate_api.py -v  # HTTP 层（需 Flask，Docker 镜像内可运行）
 node test_frontend.js                     # 前端交互冒烟测试（可选，需 Node）
 ```
 
@@ -82,8 +152,11 @@ node test_frontend.js                     # 前端交互冒烟测试（可选，
 
 ```
 app.py               Flask 应用与 REST API（SQLite 持久化）
-evaluator.py         核心校验逻辑：切分时间轴、逐段判定、相邻合并
+evaluator.py         核心校验逻辑：切分时间轴、逐段判定、相邻合并、补件批次校验
+remediation.py       补件并复核：同一 SQLite 事务中的试算与一次性写入
 test_evaluator.py    核心逻辑单元测试
+test_remediation.py  补件事务编排单元测试（不依赖 Flask）
+test_remediate_api.py 补件接口 HTTP 层测试（需 Flask）
 templates/index.html 单页界面
 static/app.js        前端交互（原生 JavaScript）
 static/style.css     样式

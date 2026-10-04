@@ -1,7 +1,7 @@
 """evaluator 核心校验逻辑的单元测试（不依赖 Flask，可直接运行）。"""
 import unittest
 
-from evaluator import evaluate_timeline
+from evaluator import evaluate_timeline, validate_supplement_batch
 
 
 def lic(lic_id, sp, start, end, allow=(), deny=(), embargo=None):
@@ -142,6 +142,96 @@ class EvaluateTimelineTest(unittest.TestCase):
             [lic(1, 1, 0, 3661, allow=["text"])], "2026-09-23", "text")
         self.assertEqual(res[0]["start_timecode"], "00:00:00")
         self.assertEqual(res[0]["end_timecode"], "01:01:01")
+
+
+def sup(sp, start, end, allow=("audio",), deny=(), embargo=None, note=""):
+    return {
+        "speaker_id": sp,
+        "start_seconds": start,
+        "end_seconds": end,
+        "allow_media": list(allow),
+        "deny_media": list(deny),
+        "embargo_until": embargo,
+        "note": note,
+    }
+
+
+class ValidateSupplementBatchTest(unittest.TestCase):
+    SPEAKERS = {1, 2}
+    DURATION = 600
+
+    def check(self, items):
+        return validate_supplement_batch(items, self.SPEAKERS, self.DURATION)
+
+    def test_valid_batch_normalized(self):
+        parsed, problem = self.check([
+            sup(1, 0, 300, allow=["audio", "audio"], note=" 补签 "),
+            sup(2, 300, 600, embargo="2027-01-01"),
+        ])
+        self.assertIsNone(problem)
+        self.assertEqual(len(parsed), 2)
+        # 媒介去重、备注去空白、空解禁日期归一为 None
+        self.assertEqual(parsed[0]["allow_media"], ["audio"])
+        self.assertEqual(parsed[0]["note"], "补签")
+        self.assertIsNone(parsed[0]["embargo_until"])
+        self.assertEqual(parsed[1]["embargo_until"], "2027-01-01")
+
+    def test_empty_batch_fails(self):
+        for items in ([], None, "x"):
+            parsed, problem = self.check(items)
+            self.assertIsNone(parsed)
+            self.assertIn("空", problem)
+
+    def test_unknown_speaker_fails(self):
+        parsed, problem = self.check([sup(99, 0, 100)])
+        self.assertIsNone(parsed)
+        self.assertIn("说话人", problem)
+
+    def test_out_of_bounds_fails(self):
+        for bad in (sup(1, 0, 601), sup(1, -1, 100), sup(1, 100, 100),
+                    sup(1, 200, 100)):
+            parsed, problem = self.check([bad])
+            self.assertIsNone(parsed, bad)
+        _, problem = self.check([sup(1, 0, 601)])
+        self.assertIn("越界", problem)
+
+    def test_non_integer_range_fails(self):
+        parsed, problem = self.check([sup(1, "0", 100)])
+        self.assertIsNone(parsed)
+        self.assertIn("整数", problem)
+
+    def test_bad_medium_fails(self):
+        parsed, problem = self.check([sup(1, 0, 100, allow=["video"])])
+        self.assertIsNone(parsed)
+        self.assertIn("媒介", problem)
+
+    def test_bad_embargo_fails(self):
+        parsed, problem = self.check([sup(1, 0, 100, embargo="2027/01/01")])
+        self.assertIsNone(parsed)
+        self.assertIn("解禁日期", problem)
+
+    def test_self_conflict_fails(self):
+        parsed, problem = self.check([sup(1, 0, 100, deny=["audio"])])
+        self.assertIsNone(parsed)
+        self.assertIn("冲突", problem)
+
+    def test_overlap_same_speaker_fails(self):
+        parsed, problem = self.check([sup(1, 0, 300), sup(1, 200, 400)])
+        self.assertIsNone(parsed)
+        self.assertIn("重叠", problem)
+        self.assertIn("第 2 条", problem)
+        self.assertIn("第 1 条", problem)
+
+    def test_touching_intervals_do_not_overlap(self):
+        # 半开区间 [0,300) 与 [300,600) 首尾相接不算重叠
+        parsed, problem = self.check([sup(1, 0, 300), sup(1, 300, 600)])
+        self.assertIsNone(problem)
+        self.assertEqual(len(parsed), 2)
+
+    def test_overlap_different_speakers_ok(self):
+        parsed, problem = self.check([sup(1, 0, 300), sup(2, 100, 400)])
+        self.assertIsNone(problem)
+        self.assertEqual(len(parsed), 2)
 
 
 if __name__ == "__main__":
